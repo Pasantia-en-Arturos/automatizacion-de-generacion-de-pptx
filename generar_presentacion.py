@@ -2,71 +2,124 @@ import os
 import re
 from pptx import Presentation
 
+def reemplazar_texto_manteniendo_formato(parrafo, texto_nuevo: str):
+    """Mantiene intacto el estilo original (fuente, color, tamaño y negrita)."""
+    if not parrafo.runs:
+        parrafo.text = texto_nuevo
+        return
+
+    parrafo.runs[0].text = texto_nuevo
+    for run in parrafo.runs[1:]:
+        run.text = ""
+
+
 def procesar_parrafo(parrafo, datos_json: dict):
-    """
-    Fusiona los fragmentos de texto (runs) y reemplaza las llaves de Claude.
-    """
     texto = parrafo.text
     if "{{" not in texto:
         return
 
-    # 1. Reemplazamos los valores que SÍ envió Claude
     for llave, valor in datos_json.items():
         marcador = f"{{{{{llave}}}}}"
         if marcador in texto:
             texto = texto.replace(marcador, str(valor))
-    
-    # 2. Limpieza suave: Si quedó alguna etiqueta sobrante como {{tip_3}} o {{norma_3}},
-    # la borramos silenciosamente (la reemplazamos por texto vacío "") para no dañar la forma.
+
     texto = re.sub(r"\{\{.*?\}\}", "", texto)
-    
-    # Asignamos el texto limpio, conservando tipografía y formato original
-    parrafo.text = texto.strip()
+    reemplazar_texto_manteniendo_formato(parrafo, texto.strip())
+
+
+def eliminar_forma(shape):
+    """Elimina físicamente un elemento (caja, imagen, círculo) del XML de la diapositiva."""
+    sp = shape._element
+    sp.getparent().remove(sp)
 
 
 def eliminar_diapositiva(prs: Presentation, index: int):
-    """Elimina físicamente una diapositiva del archivo PPTX."""
+    """Elimina físicamente una diapositiva completa."""
     rId = prs.slides._sldIdLst[index].rId
     prs.part.drop_rel(rId)
     del prs.slides._sldIdLst[index]
 
 
+def eliminar_bloque_visual_del_paso(slide, caja_de_texto_del_paso):
+    """
+    Elimina TODO el bloque visual asociado a un paso omitido:
+    La caja de texto, el círculo con el número del paso y el recuadro gris de imagen.
+    """
+    # Guardamos la posición vertical (altura en el eje Y) de la caja de texto que vamos a borrar.
+    # Usamos un margen de tolerancia (ej. 1 pulgada / ~900,000 unidades EMUs) para atrapar 
+    # elementos alineados en esa misma fila aunque estén ligeramente más arriba o abajo.
+    posicion_y = caja_de_texto_del_paso.top
+    tolerancia_y = 914400 # 1 pulgada en unidades de PowerPoint
+
+    formas_del_bloque = []
+
+    for shape in slide.shapes:
+        # Si la forma está a una altura similar en la pantalla, pertenece a este mismo paso
+        if abs(shape.top - posicion_y) < tolerancia_y:
+            formas_del_bloque.append(shape)
+
+    # Borramos todas las formas que pertenecían a la fila visual de ese paso
+    for forma in formas_del_bloque:
+        try:
+            eliminar_forma(forma)
+        except AttributeError:
+            pass # Si ya se eliminó previamente en un ciclo anterior, lo ignora
+
+
 def generar_guia_operativa(ruta_plantilla: str, ruta_salida: str, datos_claude: dict):
+    if not datos_claude or not isinstance(datos_claude, dict):
+        print("⚠️ ADVERTENCIA: No se recibieron datos de Claude. Operación cancelada.")
+        return
+
     prs = Presentation(ruta_plantilla)
     diapositivas_a_eliminar = []
 
     for idx, slide in enumerate(prs.slides):
-        # Recopilamos todo el texto de la diapositiva ANTES de procesarla
         texto_inicial_slide = ""
         for shape in slide.shapes:
             if shape.has_text_frame:
                 for p in shape.text_frame.paragraphs:
                     texto_inicial_slide += p.text
 
-        # Detectamos qué pasos específicos (ej. descripcion_paso_5) viven en esta diapositiva
         pasos_en_diapositiva = re.findall(r"\{\{(descripcion_paso_\d+)\}\}", texto_inicial_slide)
 
-        # LÓGICA DE BORRADO DE DIAPOSITIVAS:
-        # Si la diapositiva contiene pasos del procedimiento, verificamos si al menos UNO
-        # de esos pasos vino en el JSON de Claude con texto útil.
+        # REGLA 1: Si NINGÚN paso de esta diapositiva vino de Claude, se borra la diapositiva entera
         if pasos_en_diapositiva:
-            paso_activo_encontrado = any(
-                paso in datos_claude and str(datos_claude[paso]).strip() != "" 
-                for paso in pasos_en_diapositiva
-            )
-            
-            # Si ningún paso de esta diapositiva tiene datos, la marcamos para eliminar
-            if not paso_activo_encontrado:
+            pasos_activos = [
+                paso for paso in pasos_en_diapositiva 
+                if paso in datos_claude and str(datos_claude[paso]).strip() != ""
+            ]
+            if not pasos_activos:
                 diapositivas_a_eliminar.append(idx)
-                continue # Saltamos al siguiente slide sin procesar este
+                continue
 
-        # Si la diapositiva es válida, procedemos a reemplazar el contenido de sus formas
+        # REGLA 2: Si la diapositiva se conserva, revisamos si tiene pasos individuales omitidos
+        cajas_pasos_a_borrar = []
+
         for shape in slide.shapes:
-            if shape.has_text_frame:
+            if not shape.has_text_frame:
+                continue
+
+            texto_forma = "".join(p.text for p in shape.text_frame.paragraphs)
+            
+            # Verificamos si esta caja de texto es de un paso omitido (ej. Paso 6 vacío)
+            es_paso_invalido = False
+            for paso in re.findall(r"\{\{(descripcion_paso_\d+)\}\}", texto_forma):
+                if paso not in datos_claude or str(datos_claude[paso]).strip() == "":
+                    es_paso_invalido = True
+
+            if es_paso_invalido:
+                cajas_pasos_a_borrar.append(shape)
+            else:
+                # Si el paso es válido, reemplazamos sus textos y mantenemos su formato
                 for paragraph in shape.text_frame.paragraphs:
                     procesar_parrafo(paragraph, datos_claude)
 
-    # Eliminamos las diapositivas vacías de atrás hacia adelante
+        # Para cada paso que omitió Claude, borramos todo su bloque (texto + círculo + imagen)
+        for caja_paso in cajas_pasos_a_borrar:
+            eliminar_bloque_visual_del_paso(slide, caja_paso)
+
+    # Eliminamos las diapositivas marcadas como vacías (ej. la página del Paso 7)
     for index in reversed(diapositivas_a_eliminar):
         eliminar_diapositiva(prs, index)
 
@@ -74,51 +127,32 @@ def generar_guia_operativa(ruta_plantilla: str, ruta_salida: str, datos_claude: 
     print(f"✅ ¡Éxito! Guía operativa generada en: {ruta_salida}")
 
 
-# --- PRUEBA CON DATOS REALES DE TU ESTRUCTURA ---
+# --- PRUEBA CON EL PASO 5 ACTIVO Y PASO 6 VACÍO ---
 if __name__ == "__main__":
     directorio_script = os.path.dirname(os.path.abspath(__file__))
     ruta_plantilla = os.path.join(directorio_script, "plantilla.pptx")
     ruta_salida = os.path.join(directorio_script, "Guia_Lista.pptx")
 
-    if not os.path.exists(ruta_plantilla):
-        print(f"❌ ERROR: No se encontró 'plantilla.pptx' en la carpeta:\n   {directorio_script}")
-    else:
-        # Diccionario simulando la respuesta exacta de Claude adaptada a tu plantilla
-        json_real_claude = {
-            # Datos Generales (Diapositiva 1)
+    if os.path.exists(ruta_plantilla):
+        datos_prueba = {
             "nombre_proceso": "Conciliación Bancaria Mensual",
             "fecha_vigencia": "Julio 2026",
             "codigo": "FIN-001",
             "revision": "Rev. 2",
-            "objetivo": "Garantizar la exactitud del saldo en cuentas bancarias frente al libro mayor.",
-            "norma_1": "No iniciar sin el corte bancario al día 30/31 del mes.",
-            "norma_2": "Todos los ajustes deben estar aprobados por el supervisor.",
-            "norma_3": "", # Si no aplica una tercera norma, se limpia sola
+            "objetivo": "Garantizar la exactitud del saldo en cuentas bancarias.",
+            "norma_1": "Corte bancario al día 30/31 del mes.",
             "responsable_1": "Analista de Tesorería",
-            "responsable_2": "Coordinador de Contabilidad",
-            "material_1": "Extracto bancario en formato Excel o PDF.",
-            "material_2": "Reporte auxiliar de bancos exportado de Odoo.",
-            "equipo_1": "Ninguno requerido.",
-            "equipo_2": "",
-            "tip_1": "Verificar primero las partidas de mayor monto para ganar tiempo.",
-            "tip_2": "Utilizar la función BUSCARV para conciliar movimientos masivos.",
-            "tip_3": "",
-            "tiempo_ejecucion": "2 a 3 horas por cuenta",
-            "titulo_conocimiento_1": "Manejo de Odoo",
-            "texto_conocimiento_1": "Saber exportar libros auxiliares e identificar asientos.",
-            "titulo_conocimiento_2": "Excel Intermedio",
-            "texto_conocimiento_2": "Dominio de tablas dinámicas y filtros avanzados.",
-            "titulo_conocimiento_3": "",
-            "texto_conocimiento_3": "",
+            "material_1": "Extracto bancario Excel.",
+            "tiempo_ejecucion": "2 horas",
+            "contexto_operativo": "Cierre mensual.",
             
-            # Procedimiento (Diapositiva 2 en adelante)
-            "contexto_operativo": "Proceso crítico de cierre mensual en el área de finanzas.",
-            "descripcion_paso_1": "Ingresar al portal bancario con credenciales de lectura y descargar el estado de cuenta.",
-            "descripcion_paso_2": "Importar el extracto en el módulo contable y ejecutar el cruce automático.",
-            "descripcion_paso_3": "Identificar las partidas conciliadas y marcar los movimientos en tránsito.",
-            "descripcion_paso_4": "Elaborar el reporte de diferencias y enviarlo para revisión."
-            # NOTA: Omitimos intencionalmente los pasos 5, 6 y 7 para probar que 
-            # el script elimine automáticamente las últimas diapositivas.
+            # Pasos activos del 1 al 5
+            "descripcion_paso_1": "Descargar estado de cuenta.",
+            "descripcion_paso_2": "Importar en el módulo contable.",
+            "descripcion_paso_3": "Identificar partidas conciliadas.",
+            "descripcion_paso_4": "Elaborar reporte de diferencias.",
+            "descripcion_paso_5": "Enviar reporte al supervisor para aprobación final."
+            # Al no incluir el paso 6, el script destruirá su caja de texto, su círculo "6" y su recuadro gris.
         }
 
-        generar_guia_operativa(ruta_plantilla, ruta_salida, json_real_claude)
+        generar_guia_operativa(ruta_plantilla, ruta_salida, datos_prueba)
